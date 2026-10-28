@@ -19,6 +19,7 @@ import sys
 import time
 from string import Template
 
+from pyspark.sql import Window
 from pyspark.sql import functions as F
 
 PROJECT_DIR = os.getcwd()                 # folder with main.py, matcher.py, config.py, sql/
@@ -88,7 +89,11 @@ d_info = direct.select(F.col("Id").alias("Direct_ID"), F.col("Name").alias("Dire
                        F.col("Information_provider").alias("Direct_Information_Provider"))
 g_info = good.groupBy("Good_ID").agg(F.first("Good_Name", ignorenulls=True).alias("Good_Name"))
 
-matches = materialize(matches.join(d_info, "Direct_ID").join(g_info, "Good_ID"), "Matches")
+matches = matches.join(d_info, "Direct_ID").join(g_info, "Good_ID")
+# how many rows (Good IDs) the same Direct_ID has  ->  >1 = ambiguous digits
+matches = matches.withColumn("Direct_ID_Count",
+                             F.count("*").over(Window.partitionBy("Direct_ID")))
+matches = materialize(matches, "Matches")
 
 unmatched = materialize(
     direct.join(matches.select(F.col("Direct_ID").alias("Id")), "Id", "left_anti")
