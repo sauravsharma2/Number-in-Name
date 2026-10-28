@@ -79,8 +79,13 @@ def step1_exact(direct: DataFrame, good: DataFrame) -> DataFrame:
     d = direct.where(F.col("Digits") != "").select(
         F.col("Id").alias("Direct_ID"), "Country", F.col("Digits").alias("key"))
     g = good.select("Good_ID", "Country", F.col("G_Digits").alias("key"))
-    return _best(d.join(g, ["Country", "key"]), [F.col("Good_ID")], "Direct") \
-        .select("Direct_ID", "Good_ID", "Candidates", "Match_Type")
+    # keep ALL Good IDs with the same digits (one row per Direct_ID + Good_ID)
+    w_all = Window.partitionBy("Direct_ID")
+    return (d.join(g, ["Country", "key"])
+             .where(F.col("Good_ID") != F.col("Direct_ID"))
+             .select("Direct_ID", "Good_ID").dropDuplicates()
+             .withColumn("Candidates", F.size(F.collect_set("Good_ID").over(w_all)))
+             .withColumn("Match_Type", F.lit("Direct")))
 
 
 # ─── STEP 2: ANCHORED (prefix / suffix, digits only) ─────────────────────────
@@ -225,7 +230,7 @@ def add_common_links(matches: DataFrame, links: DataFrame, max_ids: int = 10) ->
 # ─── EXCEL OUTPUT ────────────────────────────────────────────────────────────
 
 EXCEL_MAX_ROWS = 1_048_575
-MATCH_COLS     = ["Direct_ID", "Direct_Name", "Good_ID", "Good_Name",
+MATCH_COLS     = ["Direct_ID", "Direct_ID_Count", "Direct_Name", "Good_ID", "Good_Name",
                   "Common_Links", "Direct_Information_Provider"]
 UNMATCHED_COLS = ["Direct_ID", "Direct_Name", "Extracted_Digits", "Direct_Information_Provider"]
 _WIDTHS = {"Direct_Name": 50, "Good_Name": 50, "Common_Links": 60}
