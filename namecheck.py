@@ -334,9 +334,61 @@ def check_pair(direct_name, good_name, lf, threshold, legal_check=False):
     }
 
 
-def check_pairs(pdf: pd.DataFrame, csv_path: str, threshold: float,
+def check_pairs(pdf: pd.DataFrame, lf: dict, threshold: float,
                 legal_check: bool = False) -> pd.DataFrame:
     """pdf needs Direct_Name, Good_Name. Returns pdf + name-check columns."""
-    lf = load_legal_forms(csv_path)
     res = [check_pair(d, g, lf, threshold, legal_check) for d, g in zip(pdf["Direct_Name"], pdf["Good_Name"])]
-    return pd.concat([pdf.reset_index(drop=True), pd.DataFrame(res)], axis=1)
+    cols = ["Direct_Clean", "Good_Clean", "Direct_LegalForms", "Good_LegalForms",
+            "Name_Score", "Name_Pass", "Fail_Reason"]
+    return pd.concat([pdf.reset_index(drop=True), pd.DataFrame(res, columns=cols)], axis=1)
+
+# ─── PREVIOUS NAMES ──────────────────────────────────────────────────────────
+
+_PREV_SPLIT = re.compile(r"[\r\n|]+")
+
+
+def build_prev_map(prev_df: pd.DataFrame) -> dict:
+    """{Good_ID: [previous name, ...]} – one field can hold several names (newline / '|')."""
+    out = defaultdict(list)
+    for gid, val in zip(prev_df["Id"], prev_df["Previous_Name"]):
+        for n in _PREV_SPLIT.split(str(val or "")):
+            n = n.strip()
+            if n and n not in out[gid]:
+                out[gid].append(n)
+    return out
+
+
+def check_previous(pdf: pd.DataFrame, prev_map: dict, lf: dict, threshold: float,
+                   legal_check: bool = False) -> pd.DataFrame:
+    """
+    For rows that FAILED on the current Good name: try every previous name of the Good_ID.
+    Pass if any previous name passes (same rules). Best passing name is kept.
+    Adds: Good_Previous_Name, Prev_Score, Prev_Pass, Prev_Fail_Reason.
+    """
+    names, scores, passes, reasons = [], [], [], []
+    for d_name, g_id, cur_pass in zip(pdf["Direct_Name"], pdf["Good_ID"], pdf["Name_Pass"]):
+        if cur_pass:
+            names.append(None); scores.append(None); passes.append(False); reasons.append(None)
+            continue
+        prevs = prev_map.get(g_id, [])
+        if not prevs:
+            names.append(None); scores.append(None); passes.append(False)
+            reasons.append("No previous name")
+            continue
+        best_pass, best_any = None, None
+        for p in prevs:
+            r = check_pair(d_name, p, lf, threshold, legal_check)
+            r["_name"] = p
+            if r["Name_Pass"] and (best_pass is None or r["Name_Score"] > best_pass["Name_Score"]):
+                best_pass = r
+            if best_any is None or r["Name_Score"] > best_any["Name_Score"]:
+                best_any = r
+        b = best_pass or best_any
+        names.append(b["_name"]); scores.append(b["Name_Score"])
+        passes.append(best_pass is not None); reasons.append(b["Fail_Reason"] or None)
+    out = pdf.copy()
+    out["Good_Previous_Name"] = names
+    out["Prev_Score"] = scores
+    out["Prev_Pass"] = passes
+    out["Prev_Fail_Reason"] = reasons
+    return out
