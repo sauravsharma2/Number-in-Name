@@ -27,8 +27,10 @@ sys.path.insert(0, PROJECT_DIR)
 
 import config
 import matcher
+import namecheck
 importlib.reload(config)
 importlib.reload(matcher)
+importlib.reload(namecheck)
 
 
 def run_sql(file_name, **params):
@@ -110,12 +112,35 @@ print(f"Total {time.time() - t0:.1f}s")
 
 # COMMAND ----------
 
+# ─── NAME CHECK on all proposals ─────────────────────────────────────────────
+from pyspark.sql.types import BooleanType, DoubleType, StringType, StructField, StructType
+
+t = time.time()
+pdf = namecheck.check_pairs(matches.toPandas(),
+                            os.path.join(PROJECT_DIR, config.LEGAL_FORM_CSV), config.THRESHOLD,
+                            config.LEGAL_FORM_CHECK)
+schema = StructType(matches.schema.fields + [
+    StructField("Direct_Clean", StringType()), StructField("Good_Clean", StringType()),
+    StructField("Direct_LegalForms", StringType()), StructField("Good_LegalForms", StringType()),
+    StructField("Name_Score", DoubleType()), StructField("Name_Pass", BooleanType()),
+    StructField("Fail_Reason", StringType()),
+])
+pdf = pdf[[f.name for f in schema.fields]].astype(object).where(pdf.notna(), None)
+matches = materialize(spark.createDataFrame(pdf, schema=schema), "NameCheck")
+print(f"Name check {time.time() - t:.1f}s")
+
+display(matches.groupBy("Match_Type", "Name_Pass").count().orderBy("Match_Type", "Name_Pass"))
+
+# COMMAND ----------
+
 # ─── OUTPUT ──────────────────────────────────────────────────────────────────
+passed = matches.where("Name_Pass")
 matcher.write_excel([
-    ("Direct Matches",   matches.where("Match_Type = 'Direct'"),   matcher.MATCH_COLS),
-    ("Anchored Matches", matches.where("Match_Type = 'Anchored'"), matcher.MATCH_COLS),
-    ("Fuzzy Matches",    matches.where("Match_Type = 'Fuzzy'"),    matcher.MATCH_COLS),
-    ("Unmatched",        unmatched,                                matcher.UNMATCHED_COLS),
+    ("Direct Matches",    passed.where("Match_Type = 'Direct'"),   matcher.MATCH_COLS),
+    ("Anchored Matches",  passed.where("Match_Type = 'Anchored'"), matcher.MATCH_COLS),
+    ("Fuzzy Matches",     passed.where("Match_Type = 'Fuzzy'"),    matcher.MATCH_COLS),
+    ("Name Check Failed", matches.where("NOT Name_Pass"),          matcher.FAILED_COLS),
+    ("Unmatched",         unmatched,                               matcher.UNMATCHED_COLS),
 ], config.OUTPUT_PATH)
 
 if config.SAVE_DELTA:
