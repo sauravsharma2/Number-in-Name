@@ -231,9 +231,13 @@ def add_common_links(matches: DataFrame, links: DataFrame, max_ids: int = 10) ->
 
 EXCEL_MAX_ROWS = 1_048_575
 MATCH_COLS     = ["Direct_ID", "Direct_ID_Count", "Direct_Name", "Good_ID", "Good_Name",
-                  "Common_Links", "Direct_Information_Provider"]
+                  "Name_Score", "Common_Links", "Direct_Information_Provider"]
+FAILED_COLS    = ["Match_Type", "Direct_ID", "Direct_ID_Count", "Direct_Name", "Good_ID", "Good_Name",
+                  "Name_Score", "Fail_Reason", "Direct_LegalForms", "Good_LegalForms",
+                  "Direct_Clean", "Good_Clean", "Common_Links", "Direct_Information_Provider"]
 UNMATCHED_COLS = ["Direct_ID", "Direct_Name", "Extracted_Digits", "Direct_Information_Provider"]
-_WIDTHS = {"Direct_Name": 50, "Good_Name": 50, "Common_Links": 60}
+_WIDTHS = {"Direct_Name": 50, "Good_Name": 50, "Common_Links": 60, "Fail_Reason": 30,
+           "Direct_Clean": 40, "Good_Clean": 40}
 
 
 def write_excel(sheets, output_path: str):
