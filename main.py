@@ -13,13 +13,16 @@
 
 # COMMAND ----------
 
+# MAGIC %pip install openpyxl rapidfuzz unidecode
+
+# COMMAND ----------
+
 import importlib
 import os
 import sys
 import time
 from string import Template
 
-from pyspark.sql import Window
 from pyspark.sql import functions as F
 
 PROJECT_DIR = os.getcwd()                 # folder with main.py, matcher.py, config.py, sql/
@@ -91,61 +94,97 @@ d_info = direct.select(F.col("Id").alias("Direct_ID"), F.col("Name").alias("Dire
                        F.col("Information_provider").alias("Direct_Information_Provider"))
 g_info = good.groupBy("Good_ID").agg(F.first("Good_Name", ignorenulls=True).alias("Good_Name"))
 
-matches = matches.join(d_info, "Direct_ID").join(g_info, "Good_ID")
-# how many rows (Good IDs) the same Direct_ID has  ->  >1 = ambiguous digits
-matches = matches.withColumn("Direct_ID_Count",
-                             F.count("*").over(Window.partitionBy("Direct_ID")))
-matches = materialize(matches, "Matches")
+matches = materialize(matches.join(d_info, "Direct_ID").join(g_info, "Good_ID"), "Matches")
 
-unmatched = materialize(
+no_proposal = materialize(
     direct.join(matches.select(F.col("Direct_ID").alias("Id")), "Id", "left_anti")
           .select(F.col("Id").alias("Direct_ID"), F.col("Name").alias("Direct_Name"),
                   F.col("Digits").alias("Extracted_Digits"),
                   F.col("Information_provider").alias("Direct_Information_Provider")),
-    "Unmatched")
+    "No digit match")
 
 display(matches.groupBy("Match_Type")
-               .agg(F.count("*").alias("matches"),
+               .agg(F.count("*").alias("proposals"),
                     F.sum(F.when(F.col("Common_Links") != "No", 1).otherwise(0)).alias("with_common_links"))
                .orderBy("Match_Type"))
 print(f"Total {time.time() - t0:.1f}s")
 
 # COMMAND ----------
 
-# ─── NAME CHECK on all proposals ─────────────────────────────────────────────
-from pyspark.sql.types import BooleanType, DoubleType, StringType, StructField, StructType
+# ─── NAME CHECK: current Good name, then Good previous names ────────────────
+import numpy as np
+import pandas as pd
 
 t = time.time()
-pdf = namecheck.check_pairs(matches.toPandas(),
-                            os.path.join(PROJECT_DIR, config.LEGAL_FORM_CSV), config.THRESHOLD,
-                            config.LEGAL_FORM_CHECK)
-schema = StructType(matches.schema.fields + [
-    StructField("Direct_Clean", StringType()), StructField("Good_Clean", StringType()),
-    StructField("Direct_LegalForms", StringType()), StructField("Good_LegalForms", StringType()),
-    StructField("Name_Score", DoubleType()), StructField("Name_Pass", BooleanType()),
-    StructField("Fail_Reason", StringType()),
-])
-pdf = pdf[[f.name for f in schema.fields]].astype(object).where(pdf.notna(), None)
-matches = materialize(spark.createDataFrame(pdf, schema=schema), "NameCheck")
-print(f"Name check {time.time() - t:.1f}s")
+lf = namecheck.load_legal_forms(os.path.join(PROJECT_DIR, config.LEGAL_FORM_CSV))
 
-display(matches.groupBy("Match_Type", "Name_Pass").count().orderBy("Match_Type", "Name_Pass"))
+# 1) current name
+pdf = namecheck.check_pairs(matches.toPandas(), lf, config.THRESHOLD, config.LEGAL_FORM_CHECK)
+
+# 2) previous names of the Good ID – only for pairs that failed on the current name
+failed_ids = pdf.loc[~pdf["Name_Pass"], "Good_ID"].dropna().unique().tolist()
+prev_map = {}
+if failed_ids:
+    ids_df = spark.createDataFrame([(x,) for x in failed_ids], "gid string")
+    prev_pdf = (run_sql("prev_names.sql")
+                .join(ids_df, F.col("Id") == F.col("gid"), "left_semi")
+                .toPandas())
+    prev_map = namecheck.build_prev_map(prev_pdf)
+pdf = namecheck.check_previous(pdf, prev_map, lf, config.THRESHOLD, config.LEGAL_FORM_CHECK)
+
+pdf["Stage"] = np.where(pdf["Name_Pass"], "Current",
+                np.where(pdf["Prev_Pass"], "Previous", "Rejected"))
+print(f"Name check {time.time() - t:.1f}s")
+print(pdf.groupby(["Match_Type", "Stage"]).size().to_string())
+
+# COMMAND ----------
+
+# ─── BUILD SHEETS ────────────────────────────────────────────────────────────
+def with_count(df):
+    """Direct_ID_Count = how many times the Direct_ID appears in THIS sheet."""
+    df = df.copy()
+    df["Direct_ID_Count"] = df.groupby("Direct_ID")["Direct_ID"].transform("size")
+    return df
+
+cur  = pdf[pdf["Stage"] == "Current"]
+prev = pdf[pdf["Stage"] == "Previous"].copy()
+prev["Name_Score"] = prev["Prev_Score"]          # score of the matching previous name
+
+# Unmatched = Direct IDs with NO accepted pair (current or previous) + no digit match at all
+accepted = set(pdf.loc[pdf["Stage"] != "Rejected", "Direct_ID"])
+rej = pdf[(pdf["Stage"] == "Rejected") & (~pdf["Direct_ID"].isin(accepted))]
+rej_rows = pd.DataFrame({
+    "Direct_ID": rej["Direct_ID"], "Direct_Name": rej["Direct_Name"],
+    "Extracted_Digits": rej["Direct_Digits"],
+    "Direct_Information_Provider": rej["Direct_Information_Provider"],
+    "Rejected_Good_ID": rej["Good_ID"], "Rejected_Good_Name": rej["Good_Name"],
+    "Fail_Reason": ("Current: " + rej["Fail_Reason"].fillna("")
+                    + " | Previous: " + rej["Prev_Fail_Reason"].fillna("")),
+})
+nodig = no_proposal.toPandas()
+nodig["Fail_Reason"] = "No digit match"
+unmatched = pd.concat([rej_rows, nodig], ignore_index=True)
+
+sheets = [
+    ("Direct Matches",        with_count(cur[cur["Match_Type"] == "Direct"]),     matcher.MATCH_COLS),
+    ("Anchored Matches",      with_count(cur[cur["Match_Type"] == "Anchored"]),   matcher.MATCH_COLS),
+    ("Fuzzy Matches",         with_count(cur[cur["Match_Type"] == "Fuzzy"]),      matcher.MATCH_COLS),
+    ("Direct_previous_name",  with_count(prev[prev["Match_Type"] == "Direct"]),   matcher.PREV_COLS),
+    ("Anchored_previous_name",with_count(prev[prev["Match_Type"] == "Anchored"]), matcher.PREV_COLS),
+    ("Fuzzy_previous_name",   with_count(prev[prev["Match_Type"] == "Fuzzy"]),    matcher.PREV_COLS),
+    ("Unmatched",             unmatched,                                          matcher.UNMATCHED_COLS),
+]
+for title, df, _ in sheets:
+    print(f"  {title:<24} {len(df):>10,}")
 
 # COMMAND ----------
 
 # ─── OUTPUT ──────────────────────────────────────────────────────────────────
-passed = matches.where("Name_Pass")
-matcher.write_excel([
-    ("Direct Matches",    passed.where("Match_Type = 'Direct'"),   matcher.MATCH_COLS),
-    ("Anchored Matches",  passed.where("Match_Type = 'Anchored'"), matcher.MATCH_COLS),
-    ("Fuzzy Matches",     passed.where("Match_Type = 'Fuzzy'"),    matcher.MATCH_COLS),
-    ("Name Check Failed", matches.where("NOT Name_Pass"),          matcher.FAILED_COLS),
-    ("Unmatched",         unmatched,                               matcher.UNMATCHED_COLS),
-], config.OUTPUT_PATH)
+matcher.write_excel(sheets, config.OUTPUT_PATH)
 
 if config.SAVE_DELTA:
-    matches.write.mode("overwrite").option("overwriteSchema", "true") \
-           .saveAsTable(f"{config.DELTA_SCHEMA}.nin_matches")
-    unmatched.write.mode("overwrite").option("overwriteSchema", "true") \
-             .saveAsTable(f"{config.DELTA_SCHEMA}.nin_unmatched")
+    for name, df in [("nin_proposals", pdf), ("nin_unmatched", unmatched)]:
+        sdf = spark.createDataFrame(df.astype(str).replace({"None": None, "nan": None}))
+        sdf.write.mode("overwrite").option("overwriteSchema", "true") \
+           .saveAsTable(f"{config.DELTA_SCHEMA}.{name}")
     print(f"Delta saved to {config.DELTA_SCHEMA}")
