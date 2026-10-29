@@ -232,16 +232,17 @@ def add_common_links(matches: DataFrame, links: DataFrame, max_ids: int = 10) ->
 EXCEL_MAX_ROWS = 1_048_575
 MATCH_COLS     = ["Direct_ID", "Direct_ID_Count", "Direct_Name", "Good_ID", "Good_Name",
                   "Name_Score", "Common_Links", "Direct_Information_Provider"]
-FAILED_COLS    = ["Match_Type", "Direct_ID", "Direct_ID_Count", "Direct_Name", "Good_ID", "Good_Name",
-                  "Name_Score", "Fail_Reason", "Direct_LegalForms", "Good_LegalForms",
-                  "Direct_Clean", "Good_Clean", "Common_Links", "Direct_Information_Provider"]
-UNMATCHED_COLS = ["Direct_ID", "Direct_Name", "Extracted_Digits", "Direct_Information_Provider"]
-_WIDTHS = {"Direct_Name": 50, "Good_Name": 50, "Common_Links": 60, "Fail_Reason": 30,
-           "Direct_Clean": 40, "Good_Clean": 40}
+PREV_COLS      = ["Direct_ID", "Direct_ID_Count", "Direct_Name", "Good_ID", "Good_Name",
+                  "Good_Previous_Name", "Name_Score", "Common_Links", "Direct_Information_Provider"]
+UNMATCHED_COLS = ["Direct_ID", "Direct_Name", "Extracted_Digits", "Direct_Information_Provider",
+                  "Rejected_Good_ID", "Rejected_Good_Name", "Fail_Reason"]
+_WIDTHS = {"Direct_Name": 50, "Good_Name": 50, "Good_Previous_Name": 50, "Common_Links": 60,
+           "Rejected_Good_Name": 50, "Fail_Reason": 50}
 
 
 def write_excel(sheets, output_path: str):
-    """sheets: list of (title, spark_df, cols). Streams rows (no toPandas)."""
+    """sheets: list of (title, df, cols). df = Spark DataFrame (streamed) or pandas DataFrame."""
+    import pandas as pd
     from openpyxl import Workbook
     from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Font
@@ -264,7 +265,13 @@ def write_excel(sheets, output_path: str):
     for title, df, cols in sheets:
         part, n = 1, 0
         ws = new_sheet(wb, title, cols)
-        for row in df.select(*cols).orderBy("Direct_ID").toLocalIterator():
+        if isinstance(df, pd.DataFrame):
+            pdf = df.reindex(columns=cols).sort_values("Direct_ID", kind="stable")
+            rows = (tuple(None if (isinstance(v, float) and v != v) else v for v in r)
+                    for r in pdf.itertuples(index=False, name=None))
+        else:
+            rows = df.select(*cols).orderBy("Direct_ID").toLocalIterator()
+        for row in rows:
             if n == EXCEL_MAX_ROWS:
                 part, n = part + 1, 0
                 ws = new_sheet(wb, f"{title} ({part})", cols)
